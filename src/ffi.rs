@@ -10,14 +10,36 @@
 /// - Functions returning `*mut T` transfer ownership to the caller
 /// - Caller frees via corresponding `fm_*_free` function
 /// - Functions taking `*const T` borrow without taking ownership
+///
+/// ## Pixel calibration
+///
+/// Every config struct has `h_pixel_size_mm` and `v_pixel_size_mm` fields.
+/// Set both to 0.0 to disable calibration (all `_mm` result fields will be 0.0).
+/// When calibrated, `_mm` fields contain geometrically correct real-world values,
+/// including proper handling of anisotropic (non-square) pixels.
 
 use std::ptr;
 
+use crate::calibration::PixelCalibration;
 use crate::error::MetrologyError;
 use crate::gauges::caliper1d::{Caliper1D, Caliper1DConfig};
 use crate::geometry::{Point2D, Vec2D};
 use crate::image::GrayImage;
 use crate::profile::EdgePolarity;
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn polarity_from_u32(v: u32) -> EdgePolarity {
+    match v {
+        0 => EdgePolarity::DarkToBright,
+        1 => EdgePolarity::BrightToDark,
+        _ => EdgePolarity::Any,
+    }
+}
+
+fn cal_from_fields(h: f64, v: f64) -> PixelCalibration {
+    PixelCalibration::new(h, v)
+}
 
 // ── Error handling ──────────────────────────────────────────────────────────
 
@@ -100,6 +122,10 @@ pub struct FmCaliper1DConfig {
     /// 0 = DarkToBright, 1 = BrightToDark, 2 = Any
     pub polarity: u32,
     pub step: f64,
+    /// Horizontal pixel size in mm. 0 = uncalibrated.
+    pub h_pixel_size_mm: f64,
+    /// Vertical pixel size in mm. 0 = uncalibrated.
+    pub v_pixel_size_mm: f64,
 }
 
 /// C-compatible edge result.
@@ -116,6 +142,16 @@ pub struct FmEdge {
 pub struct FmEdgeArray {
     pub edges: *mut FmEdge,
     pub count: u32,
+    pub status: FmStatus,
+}
+
+/// C-compatible caliper width (edge pair) result.
+#[repr(C)]
+pub struct FmCaliperWidthResult {
+    /// Distance in pixels.
+    pub distance_px: f64,
+    /// Distance in mm (0 if uncalibrated).
+    pub distance_mm: f64,
     pub status: FmStatus,
 }
 
@@ -142,19 +178,13 @@ pub unsafe extern "C" fn fm_caliper1d_find_edges(
     let image = unsafe { &*image };
     let cfg = unsafe { &*config };
 
-    let polarity = match cfg.polarity {
-        0 => EdgePolarity::DarkToBright,
-        1 => EdgePolarity::BrightToDark,
-        _ => EdgePolarity::Any,
-    };
-
     let rust_config = Caliper1DConfig {
         start: Point2D::new(cfg.start_x, cfg.start_y),
         end: Point2D::new(cfg.end_x, cfg.end_y),
         scan_width: cfg.scan_width,
         smoothing_sigma: cfg.smoothing_sigma,
         min_edge_strength: cfg.min_edge_strength,
-        polarity,
+        polarity: polarity_from_u32(cfg.polarity),
         step: cfg.step,
     };
 
@@ -195,6 +225,62 @@ pub unsafe extern "C" fn fm_caliper1d_find_edges(
     }
 }
 
+/// Measure caliper width (first edge pair distance).
+///
+/// # Safety
+/// `image` and `config` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn fm_caliper1d_measure_width(
+    image: *const GrayImage,
+    config: *const FmCaliper1DConfig,
+    min_width_px: f64,
+    max_width_px: f64,
+) -> FmCaliperWidthResult {
+    let err_result = |status| FmCaliperWidthResult {
+        distance_px: 0.0,
+        distance_mm: 0.0,
+        status,
+    };
+
+    if image.is_null() || config.is_null() {
+        return err_result(FmStatus::NullPointer);
+    }
+
+    let image = unsafe { &*image };
+    let cfg = unsafe { &*config };
+
+    let rust_config = Caliper1DConfig {
+        start: Point2D::new(cfg.start_x, cfg.start_y),
+        end: Point2D::new(cfg.end_x, cfg.end_y),
+        scan_width: cfg.scan_width,
+        smoothing_sigma: cfg.smoothing_sigma,
+        min_edge_strength: cfg.min_edge_strength,
+        polarity: polarity_from_u32(cfg.polarity),
+        step: cfg.step,
+    };
+
+    let img_ref = image.as_ref();
+    let cal = cal_from_fields(cfg.h_pixel_size_mm, cfg.v_pixel_size_mm);
+
+    match Caliper1D::measure_width(&img_ref, &rust_config, min_width_px, max_width_px) {
+        Ok(distance_px) => {
+            let dx = cfg.end_x - cfg.start_x;
+            let dy = cfg.end_y - cfg.start_y;
+            let scale = cal.scan_direction_scale(dx, dy);
+            FmCaliperWidthResult {
+                distance_px,
+                distance_mm: if cal.is_calibrated() {
+                    distance_px * scale
+                } else {
+                    0.0
+                },
+                status: FmStatus::Ok,
+            }
+        }
+        Err(ref e) => err_result(FmStatus::from(e)),
+    }
+}
+
 /// Free an edge array returned by `fm_caliper1d_find_edges`.
 ///
 /// # Safety
@@ -221,6 +307,10 @@ pub struct FmDiameterConfig {
     pub min_edge_strength: f64,
     pub polarity: u32,
     pub geometric_refinement: u32,
+    /// Horizontal pixel size in mm. 0 = uncalibrated.
+    pub h_pixel_size_mm: f64,
+    /// Vertical pixel size in mm. 0 = uncalibrated.
+    pub v_pixel_size_mm: f64,
 }
 
 /// C-compatible diameter result.
@@ -228,8 +318,14 @@ pub struct FmDiameterConfig {
 pub struct FmDiameterResult {
     pub center_x: f64,
     pub center_y: f64,
-    pub diameter: f64,
-    pub radius: f64,
+    /// Diameter in pixels.
+    pub diameter_px: f64,
+    /// Diameter in mm (0 if uncalibrated).
+    pub diameter_mm: f64,
+    /// Radius in pixels.
+    pub radius_px: f64,
+    /// Radius in mm (0 if uncalibrated).
+    pub radius_mm: f64,
     pub rms_error: f64,
     pub num_points: u32,
     pub status: FmStatus,
@@ -247,8 +343,10 @@ pub unsafe extern "C" fn fm_diameter_measure(
     let err_result = |status| FmDiameterResult {
         center_x: 0.0,
         center_y: 0.0,
-        diameter: 0.0,
-        radius: 0.0,
+        diameter_px: 0.0,
+        diameter_mm: 0.0,
+        radius_px: 0.0,
+        radius_mm: 0.0,
         rms_error: 0.0,
         num_points: 0,
         status,
@@ -260,12 +358,7 @@ pub unsafe extern "C" fn fm_diameter_measure(
 
     let image = unsafe { &*image };
     let cfg = unsafe { &*config };
-
-    let polarity = match cfg.polarity {
-        0 => EdgePolarity::DarkToBright,
-        1 => EdgePolarity::BrightToDark,
-        _ => EdgePolarity::Any,
-    };
+    let cal = cal_from_fields(cfg.h_pixel_size_mm, cfg.v_pixel_size_mm);
 
     let rust_config = crate::gauges::diameter::DiameterGaugeConfig {
         nominal_center: Point2D::new(cfg.center_x, cfg.center_y),
@@ -275,7 +368,7 @@ pub unsafe extern "C" fn fm_diameter_measure(
         scan_width: cfg.scan_width,
         smoothing_sigma: cfg.smoothing_sigma,
         min_edge_strength: cfg.min_edge_strength,
-        polarity,
+        polarity: polarity_from_u32(cfg.polarity),
         geometric_refinement: cfg.geometric_refinement != 0,
         max_iterations: 50,
     };
@@ -283,15 +376,20 @@ pub unsafe extern "C" fn fm_diameter_measure(
     let img_ref = image.as_ref();
 
     match crate::gauges::diameter::DiameterGauge::measure(&img_ref, &rust_config) {
-        Ok(r) => FmDiameterResult {
-            center_x: r.circle.center.x,
-            center_y: r.circle.center.y,
-            diameter: r.diameter,
-            radius: r.circle.radius,
-            rms_error: r.rms_error,
-            num_points: r.num_points as u32,
-            status: FmStatus::Ok,
-        },
+        Ok(r) => {
+            let radius_mm = cal.radius_to_mm(r.circle.radius);
+            FmDiameterResult {
+                center_x: r.circle.center.x,
+                center_y: r.circle.center.y,
+                diameter_px: r.diameter,
+                diameter_mm: radius_mm * 2.0,
+                radius_px: r.circle.radius,
+                radius_mm,
+                rms_error: r.rms_error,
+                num_points: r.num_points as u32,
+                status: FmStatus::Ok,
+            }
+        }
         Err(ref e) => err_result(FmStatus::from(e)),
     }
 }
@@ -311,13 +409,23 @@ pub struct FmThreadPitchConfig {
     pub expected_pitch_min: f64,
     pub expected_pitch_max: f64,
     pub step: f64,
+    /// Horizontal pixel size in mm. 0 = uncalibrated.
+    pub h_pixel_size_mm: f64,
+    /// Vertical pixel size in mm. 0 = uncalibrated.
+    pub v_pixel_size_mm: f64,
 }
 
 /// C-compatible thread pitch result.
 #[repr(C)]
 pub struct FmThreadPitchResult {
+    /// Mean pitch in pixels.
     pub mean_pitch_px: f64,
+    /// Mean pitch in mm (0 if uncalibrated).
+    pub mean_pitch_mm: f64,
+    /// Standard deviation in pixels.
     pub std_dev_px: f64,
+    /// Standard deviation in mm (0 if uncalibrated).
+    pub std_dev_mm: f64,
     pub thread_count: u32,
     pub status: FmStatus,
 }
@@ -333,7 +441,9 @@ pub unsafe extern "C" fn fm_thread_pitch_measure(
 ) -> FmThreadPitchResult {
     let err_result = |status| FmThreadPitchResult {
         mean_pitch_px: 0.0,
+        mean_pitch_mm: 0.0,
         std_dev_px: 0.0,
+        std_dev_mm: 0.0,
         thread_count: 0,
         status,
     };
@@ -344,6 +454,7 @@ pub unsafe extern "C" fn fm_thread_pitch_measure(
 
     let image = unsafe { &*image };
     let cfg = unsafe { &*config };
+    let cal = cal_from_fields(cfg.h_pixel_size_mm, cfg.v_pixel_size_mm);
 
     let rust_config = crate::gauges::thread_pitch::ThreadPitchGaugeConfig {
         start: Point2D::new(cfg.start_x, cfg.start_y),
@@ -358,12 +469,27 @@ pub unsafe extern "C" fn fm_thread_pitch_measure(
     let img_ref = image.as_ref();
 
     match crate::gauges::thread_pitch::ThreadPitchGauge::measure_by_peaks(&img_ref, &rust_config) {
-        Ok(r) => FmThreadPitchResult {
-            mean_pitch_px: r.mean_pitch_px,
-            std_dev_px: r.std_dev_px,
-            thread_count: r.thread_count as u32,
-            status: FmStatus::Ok,
-        },
+        Ok(r) => {
+            let dx = cfg.end_x - cfg.start_x;
+            let dy = cfg.end_y - cfg.start_y;
+            let scale = cal.scan_direction_scale(dx, dy);
+            FmThreadPitchResult {
+                mean_pitch_px: r.mean_pitch_px,
+                mean_pitch_mm: if cal.is_calibrated() {
+                    r.mean_pitch_px * scale
+                } else {
+                    0.0
+                },
+                std_dev_px: r.std_dev_px,
+                std_dev_mm: if cal.is_calibrated() {
+                    r.std_dev_px * scale
+                } else {
+                    0.0
+                },
+                thread_count: r.thread_count as u32,
+                status: FmStatus::Ok,
+            }
+        }
         Err(ref e) => err_result(FmStatus::from(e)),
     }
 }
@@ -397,17 +523,27 @@ pub struct FmChamferConfig {
     pub min_edge_strength: f64,
     /// 0 = DarkToBright, 1 = BrightToDark, 2 = Any
     pub polarity: u32,
+    /// Horizontal pixel size in mm. 0 = uncalibrated.
+    pub h_pixel_size_mm: f64,
+    /// Vertical pixel size in mm. 0 = uncalibrated.
+    pub v_pixel_size_mm: f64,
 }
 
 /// C-compatible chamfer result.
 #[repr(C)]
 pub struct FmChamferResult {
-    /// Angle between chamfer and surface A (degrees).
-    pub angle_a_deg: f64,
-    /// Angle between chamfer and surface B (degrees).
-    pub angle_b_deg: f64,
-    /// Chamfer width (distance between intersection points).
-    pub chamfer_width: f64,
+    /// Angle between chamfer and surface A in pixel space (degrees).
+    pub angle_a_px_deg: f64,
+    /// Angle between chamfer and surface A in real space (degrees, 0 if uncalibrated).
+    pub angle_a_mm_deg: f64,
+    /// Angle between chamfer and surface B in pixel space (degrees).
+    pub angle_b_px_deg: f64,
+    /// Angle between chamfer and surface B in real space (degrees, 0 if uncalibrated).
+    pub angle_b_mm_deg: f64,
+    /// Chamfer width in pixels.
+    pub chamfer_width_px: f64,
+    /// Chamfer width in mm (0 if uncalibrated).
+    pub chamfer_width_mm: f64,
     /// Intersection point of chamfer with surface A.
     pub intersection_a_x: f64,
     pub intersection_a_y: f64,
@@ -439,9 +575,12 @@ pub unsafe extern "C" fn fm_chamfer_measure(
     config: *const FmChamferConfig,
 ) -> FmChamferResult {
     let err_result = |status| FmChamferResult {
-        angle_a_deg: 0.0,
-        angle_b_deg: 0.0,
-        chamfer_width: 0.0,
+        angle_a_px_deg: 0.0,
+        angle_a_mm_deg: 0.0,
+        angle_b_px_deg: 0.0,
+        angle_b_mm_deg: 0.0,
+        chamfer_width_px: 0.0,
+        chamfer_width_mm: 0.0,
         intersection_a_x: 0.0,
         intersection_a_y: 0.0,
         intersection_b_x: 0.0,
@@ -456,12 +595,7 @@ pub unsafe extern "C" fn fm_chamfer_measure(
 
     let image = unsafe { &*image };
     let cfg = unsafe { &*config };
-
-    let polarity = match cfg.polarity {
-        0 => EdgePolarity::DarkToBright,
-        1 => EdgePolarity::BrightToDark,
-        _ => EdgePolarity::Any,
-    };
+    let cal = cal_from_fields(cfg.h_pixel_size_mm, cfg.v_pixel_size_mm);
 
     let rust_config = crate::gauges::chamfer::ChamferGaugeConfig {
         surface_a: scan_region_from_c(&cfg.surface_a),
@@ -470,23 +604,44 @@ pub unsafe extern "C" fn fm_chamfer_measure(
         scan_width: cfg.scan_width,
         smoothing_sigma: cfg.smoothing_sigma,
         min_edge_strength: cfg.min_edge_strength,
-        polarity,
+        polarity: polarity_from_u32(cfg.polarity),
     };
 
     let img_ref = image.as_ref();
 
     match crate::gauges::chamfer::ChamferGauge::measure(&img_ref, &rust_config) {
-        Ok(r) => FmChamferResult {
-            angle_a_deg: r.angle_a.degrees(),
-            angle_b_deg: r.angle_b.degrees(),
-            chamfer_width: r.chamfer_width,
-            intersection_a_x: r.intersection_a.x,
-            intersection_a_y: r.intersection_a.y,
-            intersection_b_x: r.intersection_b.x,
-            intersection_b_y: r.intersection_b.y,
-            max_rms_error: r.max_rms_error,
-            status: FmStatus::Ok,
-        },
+        Ok(r) => {
+            let dx = r.intersection_b.x - r.intersection_a.x;
+            let dy = r.intersection_b.y - r.intersection_a.y;
+            let chamfer_width_mm = cal.distance_px_to_mm(dx, dy);
+
+            // Real-space angles: transform the pixel-space angles through calibration
+            let angle_a_mm_deg = if cal.is_calibrated() {
+                cal.angle_to_real(r.angle_a.radians).to_degrees()
+            } else {
+                0.0
+            };
+            let angle_b_mm_deg = if cal.is_calibrated() {
+                cal.angle_to_real(r.angle_b.radians).to_degrees()
+            } else {
+                0.0
+            };
+
+            FmChamferResult {
+                angle_a_px_deg: r.angle_a.degrees(),
+                angle_a_mm_deg,
+                angle_b_px_deg: r.angle_b.degrees(),
+                angle_b_mm_deg,
+                chamfer_width_px: r.chamfer_width,
+                chamfer_width_mm,
+                intersection_a_x: r.intersection_a.x,
+                intersection_a_y: r.intersection_a.y,
+                intersection_b_x: r.intersection_b.x,
+                intersection_b_y: r.intersection_b.y,
+                max_rms_error: r.max_rms_error,
+                status: FmStatus::Ok,
+            }
+        }
         Err(ref e) => err_result(FmStatus::from(e)),
     }
 }
@@ -512,6 +667,10 @@ pub struct FmRadiusConfig {
     pub polarity: u32,
     /// Non-zero to enable geometric (LM) refinement after Taubin.
     pub geometric_refinement: u32,
+    /// Horizontal pixel size in mm. 0 = uncalibrated.
+    pub h_pixel_size_mm: f64,
+    /// Vertical pixel size in mm. 0 = uncalibrated.
+    pub v_pixel_size_mm: f64,
 }
 
 /// C-compatible radius result.
@@ -519,7 +678,10 @@ pub struct FmRadiusConfig {
 pub struct FmRadiusResult {
     pub center_x: f64,
     pub center_y: f64,
-    pub radius: f64,
+    /// Radius in pixels.
+    pub radius_px: f64,
+    /// Radius in mm (0 if uncalibrated).
+    pub radius_mm: f64,
     /// Angular span actually covered by detected points (degrees).
     pub arc_span_deg: f64,
     pub rms_error: f64,
@@ -539,7 +701,8 @@ pub unsafe extern "C" fn fm_radius_measure(
     let err_result = |status| FmRadiusResult {
         center_x: 0.0,
         center_y: 0.0,
-        radius: 0.0,
+        radius_px: 0.0,
+        radius_mm: 0.0,
         arc_span_deg: 0.0,
         rms_error: 0.0,
         num_points: 0,
@@ -552,12 +715,7 @@ pub unsafe extern "C" fn fm_radius_measure(
 
     let image = unsafe { &*image };
     let cfg = unsafe { &*config };
-
-    let polarity = match cfg.polarity {
-        0 => EdgePolarity::DarkToBright,
-        1 => EdgePolarity::BrightToDark,
-        _ => EdgePolarity::Any,
-    };
+    let cal = cal_from_fields(cfg.h_pixel_size_mm, cfg.v_pixel_size_mm);
 
     let rust_config = crate::gauges::radius::RadiusGaugeConfig {
         nominal_center: Point2D::new(cfg.center_x, cfg.center_y),
@@ -569,7 +727,7 @@ pub unsafe extern "C" fn fm_radius_measure(
         scan_width: cfg.scan_width,
         smoothing_sigma: cfg.smoothing_sigma,
         min_edge_strength: cfg.min_edge_strength,
-        polarity,
+        polarity: polarity_from_u32(cfg.polarity),
         geometric_refinement: cfg.geometric_refinement != 0,
         max_iterations: 100,
     };
@@ -580,7 +738,8 @@ pub unsafe extern "C" fn fm_radius_measure(
         Ok(r) => FmRadiusResult {
             center_x: r.circle.center.x,
             center_y: r.circle.center.y,
-            radius: r.radius,
+            radius_px: r.radius,
+            radius_mm: cal.radius_to_mm(r.radius),
             arc_span_deg: r.arc_span.degrees(),
             rms_error: r.rms_error,
             num_points: r.num_points as u32,

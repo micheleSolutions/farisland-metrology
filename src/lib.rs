@@ -26,6 +26,7 @@
 //! - Python via PyO3 or uniffi
 //! - Kotlin/Swift/Ruby via uniffi
 
+pub mod calibration;
 pub mod error;
 pub mod fitting;
 pub mod gauges;
