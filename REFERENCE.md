@@ -11,6 +11,7 @@ Version 0.1.0 — Far Island ecosystem shared library.
 - [Architecture](#architecture)
 - [Getting Started](#getting-started)
 - [Modules](#modules)
+  - [calibration — Pixel Calibration](#calibration)
   - [geometry — 2D Primitives](#geometry)
   - [image — Grayscale Image](#image)
   - [profile — 1D Profile Extraction & Edge Detection](#profile)
@@ -57,6 +58,7 @@ Version 0.1.0 — Far Island ecosystem shared library.
 farisland-metrology/
 ├── src/
 │   ├── lib.rs              # Crate root, module declarations
+│   ├── calibration.rs       # PixelCalibration (h/v mm/px, anisotropic conversion)
 │   ├── geometry.rs          # Point2D, Vec2D, Line2D, Circle2D, Segment2D, Angle
 │   ├── image.rs             # GrayImage (owned), GrayImageRef (borrowed/zero-copy)
 │   ├── error.rs             # MetrologyError enum
@@ -72,10 +74,11 @@ farisland-metrology/
 │       ├── radius.rs        # RadiusGauge
 │       └── thread_pitch.rs  # ThreadPitchGauge
 ├── tests/
+│   ├── test_calibration.rs  # 13 tests
 │   ├── test_geometry.rs     # 9 tests
 │   ├── test_profile.rs      # 8 tests
 │   ├── test_fitting.rs      # 8 tests
-│   └── test_gauges.rs       # 9 tests (34 total)
+│   └── test_gauges.rs       # 9 tests (47 total)
 ├── Cargo.toml
 └── build.rs                 # cbindgen header generation + uniffi scaffolding
 ```
@@ -133,9 +136,12 @@ FmCaliper1DConfig cfg = {
     .smoothing_sigma = 1.0,
     .min_edge_strength = 15.0,
     .polarity = 2,  // Any
-    .step = 1.0
+    .step = 1.0,
+    .h_pixel_size_mm = 0.01,  // 10 µm/px horizontal
+    .v_pixel_size_mm = 0.01   // 10 µm/px vertical (0 = uncalibrated)
 };
 
+// Find edges
 FmEdgeArray result = fm_caliper1d_find_edges(img, &cfg);
 if (result.status == Ok) {
     for (uint32_t i = 0; i < result.count; i++) {
@@ -143,6 +149,13 @@ if (result.status == Ok) {
     }
     fm_edges_free(result.edges, result.count);
 }
+
+// Measure width with calibration
+FmCaliperWidthResult width = fm_caliper1d_measure_width(img, &cfg, 50.0, 500.0);
+if (width.status == Ok) {
+    printf("Width: %.2f px = %.4f mm\n", width.distance_px, width.distance_mm);
+}
+
 fm_image_free(img);
 ```
 
@@ -170,6 +183,54 @@ try (var arena = Arena.ofConfined()) {
 ---
 
 ## Modules
+
+### calibration
+
+Pixel-to-millimeter calibration for anisotropic (non-square) pixels.
+
+#### `PixelCalibration`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `h_pixel_size_mm` | `f64` | Horizontal pixel size in mm (0 = uncalibrated) |
+| `v_pixel_size_mm` | `f64` | Vertical pixel size in mm (0 = uncalibrated) |
+
+**Key methods:**
+
+- `is_calibrated() → bool` — true when both pixel sizes > 0
+- `distance_px_to_mm(dx_px, dy_px) → f64` — convert a vector distance to mm: `sqrt((dx*h)² + (dy*v)²)`
+- `distance_along_angle_to_mm(distance_px, angle_rad) → f64` — distance along a known angle
+- `scan_direction_scale(dx_dir, dy_dir) → f64` — mm-per-pixel scale factor along a scan direction
+- `radius_to_mm(radius_px) → f64` — mean approximation: `r * (h + v) / 2`
+- `angle_to_real(angle_px_rad) → f64` — pixel-space angle → real-space angle: `atan2(sin*v, cos*h)`
+- `point_to_mm(x_px, y_px) → (f64, f64)` — convert coordinates
+
+#### Why anisotropic matters
+
+With non-square pixels (e.g. `h=0.01 mm/px`, `v=0.02 mm/px`):
+- A 100 px horizontal distance = 1.0 mm, but 100 px vertical = 2.0 mm
+- A 45° line in pixel space is actually `atan2(0.02, 0.01) ≈ 63.4°` in real space
+- A circle in pixel space is an ellipse in real space
+
+The calibration module handles all of this correctly. When `h == v`, it reduces to simple multiplication.
+
+```rust
+use farisland_metrology::calibration::PixelCalibration;
+
+let cal = PixelCalibration::new(0.01, 0.02); // 10 µm × 20 µm pixels
+
+// 100 px diagonal: sqrt((100*0.01)² + (100*0.02)²) = √5 ≈ 2.236 mm
+let d = cal.distance_px_to_mm(100.0, 100.0);
+
+// Radius 50 px: 50 * (0.01 + 0.02) / 2 = 0.75 mm
+let r = cal.radius_to_mm(50.0);
+
+// Uncalibrated — all _mm fields return 0.0
+let uncal = PixelCalibration::UNCALIBRATED;
+assert_eq!(uncal.distance_px_to_mm(100.0, 0.0), 0.0);
+```
+
+---
 
 ### geometry
 
@@ -482,23 +543,54 @@ All functions: `fm_<module>_<action>`. All types: `Fm<TypeName>`.
 | Returns `*mut T` | Caller owns. Free via corresponding `fm_*_free()`. |
 | Takes `*const T` | Borrows. Caller retains ownership. |
 
+### Pixel calibration in C ABI
+
+Every `Fm*Config` struct has two calibration fields at the end:
+
+```c
+double h_pixel_size_mm;  // horizontal pixel size in mm (0 = uncalibrated)
+double v_pixel_size_mm;  // vertical pixel size in mm (0 = uncalibrated)
+```
+
+When both are 0, all `_mm` result fields are 0. When set, `_mm` fields contain
+geometrically correct real-world values, including proper handling of non-square pixels.
+
 ### Available C functions
 
 ```c
 // Image lifecycle
-GrayImage* fm_image_create(const uint8_t* data, uint32_t width, uint32_t height);
-void       fm_image_free(GrayImage* img);
+GrayImage*          fm_image_create(const uint8_t* data, uint32_t width, uint32_t height);
+void                fm_image_free(GrayImage* img);
 
 // Caliper1D
-FmEdgeArray       fm_caliper1d_find_edges(const GrayImage*, const FmCaliper1DConfig*);
-void              fm_edges_free(FmEdge* edges, uint32_t count);
+FmEdgeArray         fm_caliper1d_find_edges(const GrayImage*, const FmCaliper1DConfig*);
+FmCaliperWidthResult fm_caliper1d_measure_width(const GrayImage*, const FmCaliper1DConfig*,
+                                                 double min_width_px, double max_width_px);
+void                fm_edges_free(FmEdge* edges, uint32_t count);
 
 // Diameter
-FmDiameterResult  fm_diameter_measure(const GrayImage*, const FmDiameterConfig*);
+FmDiameterResult    fm_diameter_measure(const GrayImage*, const FmDiameterConfig*);
+
+// Chamfer
+FmChamferResult     fm_chamfer_measure(const GrayImage*, const FmChamferConfig*);
+
+// Radius
+FmRadiusResult      fm_radius_measure(const GrayImage*, const FmRadiusConfig*);
 
 // Thread pitch
 FmThreadPitchResult fm_thread_pitch_measure(const GrayImage*, const FmThreadPitchConfig*);
 ```
+
+### Result struct field naming convention
+
+All measurement results follow this pattern:
+
+| Suffix | Meaning |
+|--------|---------|
+| `_px` | Value in pixels (always populated) |
+| `_mm` | Value in millimeters (0.0 if uncalibrated) |
+| `_px_deg` | Angle in pixel-space degrees |
+| `_mm_deg` | Angle in real-space degrees (corrected for anisotropic pixels) |
 
 ### Status codes
 
@@ -577,6 +669,8 @@ All measurements are designed for the hot path (< 1 µs FFI overhead target).
 | Thread pitch FFT (500 samples, 50 bins) | ~50 µs | Partial DFT |
 
 Release build with LTO. Measured on x86_64. No SIMD specialization yet.
+
+Pixel calibration adds negligible overhead (a few multiplications per result).
 
 ---
 
