@@ -15,7 +15,7 @@ use std::ptr;
 
 use crate::error::MetrologyError;
 use crate::gauges::caliper1d::{Caliper1D, Caliper1DConfig};
-use crate::geometry::Point2D;
+use crate::geometry::{Point2D, Vec2D};
 use crate::image::GrayImage;
 use crate::profile::EdgePolarity;
 
@@ -362,6 +362,228 @@ pub unsafe extern "C" fn fm_thread_pitch_measure(
             mean_pitch_px: r.mean_pitch_px,
             std_dev_px: r.std_dev_px,
             thread_count: r.thread_count as u32,
+            status: FmStatus::Ok,
+        },
+        Err(ref e) => err_result(FmStatus::from(e)),
+    }
+}
+
+// ── Chamfer ─────────────────────────────────────────────────────────────────
+
+/// C-compatible scan region (one surface of the chamfer).
+#[repr(C)]
+pub struct FmScanRegion {
+    pub start_x: f64,
+    pub start_y: f64,
+    pub end_x: f64,
+    pub end_y: f64,
+    pub step_dir_x: f64,
+    pub step_dir_y: f64,
+    pub step_size: f64,
+    pub num_lines: u32,
+}
+
+/// C-compatible chamfer measurement config.
+#[repr(C)]
+pub struct FmChamferConfig {
+    /// Scan region for surface A.
+    pub surface_a: FmScanRegion,
+    /// Scan region for the chamfer surface.
+    pub chamfer_surface: FmScanRegion,
+    /// Scan region for surface B.
+    pub surface_b: FmScanRegion,
+    pub scan_width: u32,
+    pub smoothing_sigma: f64,
+    pub min_edge_strength: f64,
+    /// 0 = DarkToBright, 1 = BrightToDark, 2 = Any
+    pub polarity: u32,
+}
+
+/// C-compatible chamfer result.
+#[repr(C)]
+pub struct FmChamferResult {
+    /// Angle between chamfer and surface A (degrees).
+    pub angle_a_deg: f64,
+    /// Angle between chamfer and surface B (degrees).
+    pub angle_b_deg: f64,
+    /// Chamfer width (distance between intersection points).
+    pub chamfer_width: f64,
+    /// Intersection point of chamfer with surface A.
+    pub intersection_a_x: f64,
+    pub intersection_a_y: f64,
+    /// Intersection point of chamfer with surface B.
+    pub intersection_b_x: f64,
+    pub intersection_b_y: f64,
+    /// Worst RMS error among the three line fits.
+    pub max_rms_error: f64,
+    pub status: FmStatus,
+}
+
+fn scan_region_from_c(r: &FmScanRegion) -> crate::gauges::chamfer::ScanRegion {
+    crate::gauges::chamfer::ScanRegion {
+        start: Point2D::new(r.start_x, r.start_y),
+        end: Point2D::new(r.end_x, r.end_y),
+        step_direction: Vec2D::new(r.step_dir_x, r.step_dir_y),
+        step_size: r.step_size,
+        num_lines: r.num_lines,
+    }
+}
+
+/// Measure chamfer geometry from three scan regions.
+///
+/// # Safety
+/// `image` and `config` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn fm_chamfer_measure(
+    image: *const GrayImage,
+    config: *const FmChamferConfig,
+) -> FmChamferResult {
+    let err_result = |status| FmChamferResult {
+        angle_a_deg: 0.0,
+        angle_b_deg: 0.0,
+        chamfer_width: 0.0,
+        intersection_a_x: 0.0,
+        intersection_a_y: 0.0,
+        intersection_b_x: 0.0,
+        intersection_b_y: 0.0,
+        max_rms_error: 0.0,
+        status,
+    };
+
+    if image.is_null() || config.is_null() {
+        return err_result(FmStatus::NullPointer);
+    }
+
+    let image = unsafe { &*image };
+    let cfg = unsafe { &*config };
+
+    let polarity = match cfg.polarity {
+        0 => EdgePolarity::DarkToBright,
+        1 => EdgePolarity::BrightToDark,
+        _ => EdgePolarity::Any,
+    };
+
+    let rust_config = crate::gauges::chamfer::ChamferGaugeConfig {
+        surface_a: scan_region_from_c(&cfg.surface_a),
+        chamfer_surface: scan_region_from_c(&cfg.chamfer_surface),
+        surface_b: scan_region_from_c(&cfg.surface_b),
+        scan_width: cfg.scan_width,
+        smoothing_sigma: cfg.smoothing_sigma,
+        min_edge_strength: cfg.min_edge_strength,
+        polarity,
+    };
+
+    let img_ref = image.as_ref();
+
+    match crate::gauges::chamfer::ChamferGauge::measure(&img_ref, &rust_config) {
+        Ok(r) => FmChamferResult {
+            angle_a_deg: r.angle_a.degrees(),
+            angle_b_deg: r.angle_b.degrees(),
+            chamfer_width: r.chamfer_width,
+            intersection_a_x: r.intersection_a.x,
+            intersection_a_y: r.intersection_a.y,
+            intersection_b_x: r.intersection_b.x,
+            intersection_b_y: r.intersection_b.y,
+            max_rms_error: r.max_rms_error,
+            status: FmStatus::Ok,
+        },
+        Err(ref e) => err_result(FmStatus::from(e)),
+    }
+}
+
+// ── Radius ──────────────────────────────────────────────────────────────────
+
+/// C-compatible radius measurement config.
+#[repr(C)]
+pub struct FmRadiusConfig {
+    pub center_x: f64,
+    pub center_y: f64,
+    pub nominal_radius: f64,
+    /// Start angle of the arc (radians, 0 = +X axis).
+    pub start_angle_rad: f64,
+    /// End angle of the arc (radians, counterclockwise).
+    pub end_angle_rad: f64,
+    pub search_margin: f64,
+    pub num_calipers: u32,
+    pub scan_width: u32,
+    pub smoothing_sigma: f64,
+    pub min_edge_strength: f64,
+    /// 0 = DarkToBright, 1 = BrightToDark, 2 = Any
+    pub polarity: u32,
+    /// Non-zero to enable geometric (LM) refinement after Taubin.
+    pub geometric_refinement: u32,
+}
+
+/// C-compatible radius result.
+#[repr(C)]
+pub struct FmRadiusResult {
+    pub center_x: f64,
+    pub center_y: f64,
+    pub radius: f64,
+    /// Angular span actually covered by detected points (degrees).
+    pub arc_span_deg: f64,
+    pub rms_error: f64,
+    pub num_points: u32,
+    pub status: FmStatus,
+}
+
+/// Measure radius of a partial arc.
+///
+/// # Safety
+/// `image` and `config` must be valid non-null pointers.
+#[no_mangle]
+pub unsafe extern "C" fn fm_radius_measure(
+    image: *const GrayImage,
+    config: *const FmRadiusConfig,
+) -> FmRadiusResult {
+    let err_result = |status| FmRadiusResult {
+        center_x: 0.0,
+        center_y: 0.0,
+        radius: 0.0,
+        arc_span_deg: 0.0,
+        rms_error: 0.0,
+        num_points: 0,
+        status,
+    };
+
+    if image.is_null() || config.is_null() {
+        return err_result(FmStatus::NullPointer);
+    }
+
+    let image = unsafe { &*image };
+    let cfg = unsafe { &*config };
+
+    let polarity = match cfg.polarity {
+        0 => EdgePolarity::DarkToBright,
+        1 => EdgePolarity::BrightToDark,
+        _ => EdgePolarity::Any,
+    };
+
+    let rust_config = crate::gauges::radius::RadiusGaugeConfig {
+        nominal_center: Point2D::new(cfg.center_x, cfg.center_y),
+        nominal_radius: cfg.nominal_radius,
+        start_angle: cfg.start_angle_rad,
+        end_angle: cfg.end_angle_rad,
+        search_margin: cfg.search_margin,
+        num_calipers: cfg.num_calipers,
+        scan_width: cfg.scan_width,
+        smoothing_sigma: cfg.smoothing_sigma,
+        min_edge_strength: cfg.min_edge_strength,
+        polarity,
+        geometric_refinement: cfg.geometric_refinement != 0,
+        max_iterations: 100,
+    };
+
+    let img_ref = image.as_ref();
+
+    match crate::gauges::radius::RadiusGauge::measure(&img_ref, &rust_config) {
+        Ok(r) => FmRadiusResult {
+            center_x: r.circle.center.x,
+            center_y: r.circle.center.y,
+            radius: r.radius,
+            arc_span_deg: r.arc_span.degrees(),
+            rms_error: r.rms_error,
+            num_points: r.num_points as u32,
             status: FmStatus::Ok,
         },
         Err(ref e) => err_result(FmStatus::from(e)),
